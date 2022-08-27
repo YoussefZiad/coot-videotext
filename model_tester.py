@@ -1,10 +1,3 @@
-"""
-Train captioning with MART.
-
-Originally published by https://github.com/jayleicn/recurrent-transformer under MIT license
-Reworked by https://github.com/gingsi/coot-videotext under Apache 2 license
-"""
-
 import numpy as np
 import torch
 import h5py
