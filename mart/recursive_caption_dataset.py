@@ -130,6 +130,8 @@ class RecursiveCaptionDataset(data.Dataset):
         raw_data = json.load(data_path.open("rt", encoding="utf8"))
         coll_data = []
         for i, (k, line) in enumerate(tqdm(list(raw_data.items()))):
+            # print("i: "+str(i)+", k: "+str(k)+", line: "+str(line))
+            # return
             if dataset_max is not None and i >= dataset_max > 0:
                 break
             line["name"] = k
@@ -345,7 +347,7 @@ class RecursiveCaptionDataset(data.Dataset):
 
     def convert_example_to_features(self, example):
         """
-        example single snetence
+        example single sentence
         {"name": str,
          "duration": float,
          "timestamp": [st(float), ed(float)],
@@ -764,3 +766,61 @@ def create_mart_datasets_and_loaders(
         num_workers=cfg.dataset_val.num_workers, pin_memory=cfg.dataset_val.pin_memory)
 
     return train_dataset, val_dataset, train_loader, val_loader
+
+def caption_collate(batch):
+    """get rid of unexpected list transpose in default_collate
+    https://github.com/pytorch/pytorch/blob/master/torch/utils/data/_utils/collate.py#L66
+
+    HOW to batch clip-sentence pair?
+    1) directly copy the last sentence, but do not count them in when back-prop OR
+    2) put all -1 to their text token label, treat
+    """
+    # collect meta
+    raw_batch_meta = [e[1] for e in batch]
+    batch_meta = []
+    for e in raw_batch_meta:
+        cur_meta = dict(
+            name=None,
+            timestamp=[],
+            gt_sentence=[]
+        )
+        for d in e:
+            cur_meta["name"] = d["name"]
+            cur_meta["timestamp"].append(d["timestamp"])
+            cur_meta["gt_sentence"].append(d["sentence"])
+        batch_meta.append(cur_meta)
+
+    batch = [e[0] for e in batch]
+    # Step1: pad each example to max_n_sen
+    max_n_sen = max([len(e) for e in batch])
+    raw_step_sizes = []
+
+    padded_batch = []
+    padding_clip_sen_data = copy.deepcopy(batch[0][0])  # doesn"t matter which one is used
+    padding_clip_sen_data["input_labels"][:] = RecursiveCaptionDataset.IGNORE
+    for ele in batch:
+        cur_n_sen = len(ele)
+        if cur_n_sen < max_n_sen:
+            ele = ele + [padding_clip_sen_data] * (max_n_sen - cur_n_sen)
+        raw_step_sizes.append(cur_n_sen)
+        padded_batch.append(ele)
+
+    # Step2: batching each steps individually in the batches
+    collated_step_batch = []
+    for step_idx in range(max_n_sen):
+        collated_step = step_collate([e[step_idx] for e in padded_batch])
+        collated_step_batch.append(collated_step)
+    return collated_step_batch, raw_step_sizes, batch_meta
+
+
+def single_sentence_collate(batch):
+    """get rid of unexpected list transpose in default_collate
+    https://github.com/pytorch/pytorch/blob/master/torch/utils/data/_utils/collate.py#L66
+    """
+    # collect meta
+    batch_meta = [{"name": e[1]["name"],
+                   "timestamp": e[1]["timestamp"],
+                   "gt_sentence": e[1]["sentence"]
+                   } for e in batch]  # change key
+    padded_batch = step_collate([e[0] for e in batch])
+    return padded_batch, None, batch_meta

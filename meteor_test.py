@@ -25,6 +25,10 @@ def check_meteor_works():
         print(f"{e.__class__.__name__}: {e}")
         met.lock.release()
         return False
+    except OSError as e1:
+        print(f"{e1.__class__.__name__}: {e1}")
+        met.lock.release()
+        return False
     print(output)
     return True
 

@@ -5,7 +5,7 @@ YAML file loading and saving utilities.
 from pathlib import Path
 from pprint import pprint
 from typing import Any, Dict, Union, Mapping
-from collections import Mapping as CollectionsMapping
+from collections.abc import Mapping as CollectionsMapping
 
 import yaml
 

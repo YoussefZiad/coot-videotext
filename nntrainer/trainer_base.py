@@ -8,6 +8,7 @@ from pathlib import Path
 from timeit import default_timer as timer
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
 import torch as th
 from torch import nn
 from torch.backends import cudnn
@@ -362,7 +363,7 @@ class BaseTrainer:
             if self.load_model:
                 # load model from file. this would start training from epoch 0, but is usually only used for validation.
                 self.logger.info(f"Loading model from checkpoint file {self.load_model}")
-                model_state = th.load(str(self.load_model))
+                model_state = th.load(str(self.load_model),map_location=torch.device('cpu'))
                 self.model_mgr.set_model_state(model_state)
             else:
                 # load model given an epoch. also reload metrics and optimization to correctly continue training.

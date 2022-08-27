@@ -476,12 +476,14 @@ class MartTrainer(trainer_base.BaseTrainer):
                         # example_idx indicates which example is in the batch
                         for step_idx, step_batch in enumerate(dec_seq_list[:step_size]):
                             # step_idx or we can also call it sen_idx
-                            batch_res["results"][cur_meta["name"]].append({"sentence": dataset.convert_ids_to_sentence(
+                            thedata = {"sentence": dataset.convert_ids_to_sentence(
                                 step_batch[example_idx].cpu().tolist()),
                                 # remove encoding
                                 # .encode("ascii", "ignore"),
                                 "timestamp": cur_meta["timestamp"][step_idx],
-                                "gt_sentence": cur_meta["gt_sentence"][step_idx]})
+                                "gt_sentence": cur_meta["gt_sentence"][step_idx]}
+                            batch_res["results"][cur_meta["name"]].append(thedata)
+                            #print(thedata)
                     if self.cfg.debug:
                         print(f"Vid feat {[v.mean().item() for v in video_features_list]}")
                 elif self.cfg.untied or self.cfg.mtrans:
@@ -656,6 +658,441 @@ class MartTrainer(trainer_base.BaseTrainer):
                     self.logger.info(f"Updated meteor in file {metrics_file}")
 
         return total_loss, val_score, is_best, flat_metrics
+
+    #New Code Begins
+
+    @th.no_grad()
+    def generate_text(self, data_loader: data.DataLoader) -> (
+            Tuple[float, float, bool, Dict[str, float]]):
+        """
+        Run both validation and translation.
+
+        Validation: The same setting as training, where ground-truth word x_{t-1} is used to predict next word x_{t},
+        not realistic for real inference.
+
+        Translation: Use greedy generated words to predicted next words, the true inference situation.
+        eval_mode can only be set to `val` here, as setting to `test` is cheating
+        0. run inference, 1. Get METEOR, BLEU1-4, CIDEr scores, 2. Get vocab size, sentence length
+
+        Args:
+            data_loader: Dataloader for validation
+
+        Returns:
+            Tuple of:
+                validation loss
+                validation score
+                epoch is best
+                custom metrics with translation results dictionary
+        """
+        self.hook_pre_val_epoch()  # pre val epoch hook: set models to val and start timers
+        forward_time_total = 0
+        total_loss = 0
+        n_word_total = 0
+        n_word_correct = 0
+
+        # setup ema
+        if self.ema is not None:
+            self.ema.assign(self.model)
+
+        # setup translation submission
+        batch_res = {"version": "VERSION 1.0", "results": defaultdict(list),
+                     "external_data": {"used": "true", "details": "ay"}}
+        dataset: RecursiveCaptionDataset = data_loader.dataset
+
+        # ---------- Dataloader Iteration ----------
+        num_steps = 0
+        pbar = tqdm(total=len(data_loader), desc=f"Validate epoch {self.state.current_epoch}")
+        for _step, batch in enumerate(data_loader):
+            # ---------- forward pass ----------
+            self.hook_pre_step_timer()  # hook for step timing
+
+            with autocast(enabled=self.cfg.fp16_val):
+                if self.cfg.recurrent:
+                    # recurrent MART, TransformerXL, ...
+                    # get data
+                    batched_data = [prepare_batch_inputs(
+                        step_data, use_cuda=self.cfg.use_cuda, non_blocking=self.cfg.cuda_non_blocking)
+                        for step_data in batch[0]]
+                    print("Batch[0]:" + str(batch[0]))
+                    print("Batch[1]:" + str(batch[1]))
+                    print("Batch[2]:" + str(batch[2]))
+                    print(len(batch))
+                    return
+                    # validate (ground truth as input for next token)
+                    input_ids_list = [e["input_ids"] for e in batched_data]
+                    video_features_list = [e["video_feature"] for e in
+                                           batched_data]
+                    input_masks_list = [e["input_mask"] for e in batched_data]
+                    token_type_ids_list = [e["token_type_ids"] for e in
+                                           batched_data]
+                    input_labels_list = [e["input_labels"] for e in batched_data]
+                    loss, pred_scores_list = self.model(input_ids_list, video_features_list, input_masks_list,
+                                                        token_type_ids_list, input_labels_list)
+                    # translate (no ground truth text)
+                    step_sizes = batch[1]  # list(int), len == bsz
+                    meta = batch[2]  # list(dict), len == bsz
+                    model_inputs = [
+                        [e["input_ids"] for e in batched_data],
+                        [e["video_feature"] for e in batched_data],
+                        [e["input_mask"] for e in batched_data],
+                        [e["token_type_ids"] for e in batched_data]]
+                    dec_seq_list = self.translator.translate_batch(
+                        model_inputs, use_beam=self.cfg.use_beam, recurrent=True,
+                        untied=False, xl=self.cfg.xl)
+
+                    for example_idx, (step_size, cur_meta) in enumerate(zip(step_sizes, meta)):
+                        # example_idx indicates which example is in the batch
+                        print("Results for example "+str(example_idx))
+                        for step_idx, step_batch in enumerate(dec_seq_list[:step_size]):
+                            # step_idx or we can also call it sen_idx
+                            thedata = {"sentence": dataset.convert_ids_to_sentence(
+                                step_batch[example_idx].cpu().tolist()),
+                                # remove encoding
+                                # .encode("ascii", "ignore"),
+                                "timestamp": cur_meta["timestamp"][step_idx],
+                                "gt_sentence": cur_meta["gt_sentence"][step_idx]}
+                            batch_res["results"][cur_meta["name"]].append(thedata)
+                            print(thedata)
+                    if self.cfg.debug:
+                        print(f"Vid feat {[v.mean().item() for v in video_features_list]}")
+                elif self.cfg.untied or self.cfg.mtrans:
+                    # single sentence model MART untied or Vanilla Transformer
+                    meta = batch[2]  # list(dict), len == bsz
+
+                    # validate
+                    batched_data = prepare_batch_inputs(batch[0], use_cuda=self.cfg.use_cuda,
+                                                        non_blocking=self.cfg.cuda_non_blocking)
+                    video_feature = batched_data["video_feature"]
+                    video_mask = batched_data["video_mask"]
+                    text_ids = batched_data["text_ids"]
+                    text_mask = batched_data["text_mask"]
+                    text_labels = batched_data["text_labels"]
+
+                    loss, pred_scores = self.model(video_feature, video_mask, text_ids, text_mask, text_labels)
+                    pred_scores_list = [pred_scores]
+                    input_labels_list = [text_labels]
+
+                    # translate
+                    model_inputs = [batched_data["video_feature"], batched_data["video_mask"], batched_data["text_ids"],
+                                    batched_data["text_mask"], batched_data["text_labels"]]
+
+                    dec_seq = self.translator.translate_batch(
+                        model_inputs, use_beam=self.cfg.use_beam, recurrent=False, untied=True)
+                    for example_idx, (cur_gen_sen, cur_meta) in enumerate(zip(dec_seq, meta)):
+                        # example_idx indicates which example is in the batch
+                        cur_data = {
+                            "sentence": dataset.convert_ids_to_sentence(cur_gen_sen.cpu().tolist()),
+                            # remove encoding .encode("utf-8"), "ascii", "ignore"),
+                            "timestamp": cur_meta["timestamp"], "gt_sentence": cur_meta["gt_sentence"]}
+                        batch_res["results"][cur_meta["name"]].append(cur_data)
+                else:
+                    # non-recurrent but also not untied model (?)
+                    meta = batch[2]  # list(dict), len == bsz
+
+                    # validate
+                    batched_data = prepare_batch_inputs(batch[0], use_cuda=self.cfg.use_cuda,
+                                                        non_blocking=self.cfg.cuda_non_blocking)
+                    input_ids = batched_data["input_ids"]
+                    video_features = batched_data["video_feature"]
+                    input_masks = batched_data["input_mask"]
+                    token_type_ids = batched_data["token_type_ids"]
+                    input_labels = batched_data["input_labels"]
+                    loss, pred_scores = self.model(input_ids, video_features, input_masks, token_type_ids, input_labels)
+                    pred_scores_list = [pred_scores]
+                    input_labels_list = [input_labels]
+                    # translate
+                    model_inputs = [batched_data["input_ids"], batched_data["video_feature"],
+                                    batched_data["input_mask"], batched_data["token_type_ids"]]
+                    dec_seq = self.translator.translate_batch(
+                        model_inputs, use_beam=self.cfg.use_beam, recurrent=False, untied=False)
+                    for example_idx, (cur_gen_sen, cur_meta) in enumerate(zip(dec_seq, meta)):
+                        # example_idx indicates which example is in the batch
+                        cur_data = {
+                            "sentence": dataset.convert_ids_to_sentence(cur_gen_sen.cpu().tolist()),
+                            # remove encoding .encode("utf-8"), "ascii", "ignore"),
+                            "timestamp": cur_meta["timestamp"], "gt_sentence": cur_meta["gt_sentence"]}
+                        batch_res["results"][cur_meta["name"]].append(cur_data)
+
+                # keep logs
+                n_correct = 0
+                n_word = 0
+                for pred, gold in zip(pred_scores_list, input_labels_list):
+                    n_correct += cal_performance(pred, gold)
+                    valid_label_mask = gold.ne(RecursiveCaptionDataset.IGNORE)
+                    n_word += valid_label_mask.sum().item()
+
+                # calculate metrix
+                n_word_total += n_word
+                n_word_correct += n_correct
+                total_loss += loss.item()
+
+            # end of step
+            self.hook_post_forward_step_timer()
+            forward_time_total += self.timedelta_step_forward
+            num_steps += 1
+
+            if self.cfg.debug:
+                break
+
+            pbar.update()
+        pbar.close()
+
+        # ---------- validation done ----------
+
+        # # sort translation
+        # batch_res["results"] = self.translator.sort_res(batch_res["results"])
+        #
+        # # write translation results of this epoch to file
+        # eval_mode = self.cfg.dataset_val.split  # which dataset split
+        # file_translation_raw = self.exp.get_translation_files(self.state.current_epoch, eval_mode)
+        # json.dump(batch_res, file_translation_raw.open("wt", encoding="utf8"))
+        #
+        # # get reference files (ground truth captions)
+        # reference_files_map = get_reference_files(self.cfg.dataset_val.name, self.exp.annotations_dir)
+        # reference_files = reference_files_map[eval_mode]
+        # reference_file_single = reference_files[0]
+        #
+        # # language evaluation
+        # res_lang = evaluate_language_files(file_translation_raw, reference_files, verbose=False, all_scorer=True)
+        # # basic stats
+        # res_stats = evaluate_stats_files(file_translation_raw, reference_file_single, verbose=False)
+        # # repetition
+        # res_rep = evaluate_repetition_files(file_translation_raw, reference_file_single, verbose=False)
+        #
+        # # merge results
+        # all_metrics = {**res_lang, **res_stats, **res_rep}
+        # assert len(all_metrics) == len(res_lang) + len(res_stats) + len(res_rep), (
+        #     "Lost infos while merging translation results!")
+        #
+        # # flatten results and make them json compatible
+        # flat_metrics = {}
+        # for key, val in all_metrics.items():
+        #     if isinstance(val, Mapping):
+        #         for subkey, subval in val.items():
+        #             flat_metrics[f"{key}_{subkey}"] = subval
+        #         continue
+        #     flat_metrics[key] = val
+        # for key, val in flat_metrics.items():
+        #     if isinstance(val, (np.float16, np.float32, np.float64)):
+        #         flat_metrics[key] = float(val)
+        #
+        # # feed meters
+        # for result_key, meter_name in TRANSLATION_METRICS.items():
+        #     self.metrics.update_meter(meter_name, flat_metrics[result_key])
+        #
+        # # log translation results
+        # self.logger.info(f"Done with translation, epoch {self.state.current_epoch} split {eval_mode}")
+        # self.logger.info(", ".join([f"{name} {flat_metrics[name]:.2%}" for name in TRANSLATION_METRICS_LOG]))
+        #
+        # # calculate and output validation metrics
+        # loss_per_word = 1.0 * total_loss / n_word_total
+        # accuracy = 1.0 * n_word_correct / n_word_total
+        # self.metrics.update_meter(MMeters.TRAIN_LOSS_PER_WORD, loss_per_word)
+        # self.metrics.update_meter(MMeters.TRAIN_ACC, accuracy)
+        # forward_time_total /= num_steps
+        # self.logger.info(
+        #     f"Loss {loss_per_word:.5f} Acc {accuracy:.3%} total {timer() - self.timer_val_epoch:.3f}s, "
+        #     f"forward {forward_time_total:.3f}s")
+        #
+        # # find field which determines whether this is a new best epoch
+        # if self.cfg.val.det_best_field == "cider":
+        #     val_score = flat_metrics["CIDEr"]
+        # else:
+        #     raise NotImplementedError(f"best field {self.cfg.val.det_best_field} not known")
+        #
+        # # check for a new best epoch and update validation results
+        # is_best = self.check_is_new_best(val_score)
+        # self.hook_post_val_epoch(loss_per_word, is_best)
+        #
+        # if self.is_test:
+        #     # for test runs, save the validation results separately to a file
+        #     self.metrics.feed_metrics(False, self.state.total_step, self.state.current_epoch)
+        #     metrics_file = self.exp.path_base / f"val_ep_{self.state.current_epoch}.json"
+        #     self.metrics.save_epoch_to_file(metrics_file)
+        #     self.logger.info(f"Saved validation results to {metrics_file}")
+        #
+        #     # update the meteor metric in the result if it's -999 because java crashed. only in some conditions
+        #     best_ep = self.exp.find_best_epoch()
+        #     self.logger.info(f"Dataset split config {self.cfg.dataset_val.split} loaded {self.load_ep} best {best_ep}")
+        #     if self.cfg.dataset_val.split == "val" and self.load_ep == best_ep == self.state.current_epoch:
+        #         # load metrics file and write it back with the new meteor IFF meteor is -999
+        #         metrics_file = self.exp.get_metrics_epoch_file(best_ep)
+        #         metrics_data = json.load(metrics_file.open("rt", encoding="utf8"))
+        #         # metrics has stored meteor as a list of tuples (epoch, value). convert to dict, update, convert back.
+        #         meteor_dict = dict(metrics_data[TextMetricsConst.METEOR])
+        #         if ((meteor_dict[best_ep] + 999) ** 2) < 1e-4:
+        #             meteor_dict[best_ep] = flat_metrics[TextMetricsConstEvalCap.METEOR]
+        #             metrics_data[TextMetricsConst.METEOR] = list(meteor_dict.items())
+        #             json.dump(metrics_data, metrics_file.open("wt", encoding="utf8"))
+        #             self.logger.info(f"Updated meteor in file {metrics_file}")
+
+        return
+
+    def generate_text_external_source(self, batch, data_loader: data.DataLoader):
+        """
+        Run both validation and translation.
+
+        Validation: The same setting as training, where ground-truth word x_{t-1} is used to predict next word x_{t},
+        not realistic for real inference.
+
+        Translation: Use greedy generated words to predicted next words, the true inference situation.
+        eval_mode can only be set to `val` here, as setting to `test` is cheating
+        0. run inference, 1. Get METEOR, BLEU1-4, CIDEr scores, 2. Get vocab size, sentence length
+
+        Args:
+            batch: the data
+            data_loader: Dataloader for validation
+
+        Returns:
+            Tuple of:
+                validation loss
+                validation score
+                epoch is best
+                custom metrics with translation results dictionary
+        """
+        self.hook_pre_val_epoch()  # pre val epoch hook: set models to val and start timers
+        forward_time_total = 0
+        total_loss = 0
+        n_word_total = 0
+        n_word_correct = 0
+
+        # setup ema
+        if self.ema is not None:
+            self.ema.assign(self.model)
+
+        # setup translation submission
+        batch_res = {"version": "VERSION 1.0", "results": defaultdict(list),
+                     "external_data": {"used": "true", "details": "ay"}}
+        dataset: RecursiveCaptionDataset = data_loader.dataset
+
+        # ---------- Dataloader Iteration ----------
+        num_steps = 0
+        pbar = tqdm(total=len(data_loader), desc=f"Validate epoch {self.state.current_epoch}")
+        # ---------- forward pass ----------
+        self.hook_pre_step_timer()  # hook for step timing
+
+        with autocast(enabled=self.cfg.fp16_val):
+            if self.cfg.recurrent:
+                # recurrent MART, TransformerXL, ...
+                # get data
+                batched_data = [prepare_batch_inputs(
+                    step_data, use_cuda=self.cfg.use_cuda, non_blocking=self.cfg.cuda_non_blocking)
+                    for step_data in batch[0]]
+                # validate (ground truth as input for next token)
+                input_ids_list = [e["input_ids"] for e in batched_data]
+                video_features_list = [e["video_feature"] for e in
+                                       batched_data]
+                input_masks_list = [e["input_mask"] for e in batched_data]
+                token_type_ids_list = [e["token_type_ids"] for e in
+                                       batched_data]
+                input_labels_list = [e["input_labels"] for e in batched_data]
+                loss, pred_scores_list = self.model(input_ids_list, video_features_list, input_masks_list,
+                                                    token_type_ids_list, input_labels_list)
+                # translate (no ground truth text)
+                step_sizes = batch[1]  # list(int), len == bsz
+                meta = batch[2]  # list(dict), len == bsz
+                model_inputs = [
+                    [e["input_ids"] for e in batched_data],
+                    [e["video_feature"] for e in batched_data],
+                    [e["input_mask"] for e in batched_data],
+                    [e["token_type_ids"] for e in batched_data]]
+                dec_seq_list = self.translator.translate_batch(
+                    model_inputs, use_beam=self.cfg.use_beam, recurrent=True,
+                    untied=False, xl=self.cfg.xl)
+
+                for example_idx, (step_size, cur_meta) in enumerate(zip(step_sizes, meta)):
+                    # example_idx indicates which example is in the batch
+                    print("Results for example "+str(example_idx))
+                    for step_idx, step_batch in enumerate(dec_seq_list[:step_size]):
+                        # step_idx or we can also call it sen_idx
+                        thedata = {"sentence": dataset.convert_ids_to_sentence(
+                            step_batch[example_idx].cpu().tolist()),
+                            # remove encoding
+                            # .encode("ascii", "ignore"),
+                            "timestamp": cur_meta["timestamp"][step_idx],
+                            "gt_sentence": cur_meta["gt_sentence"][step_idx]}
+                        batch_res["results"][cur_meta["name"]].append(thedata)
+                        print(thedata)
+                if self.cfg.debug:
+                    print(f"Vid feat {[v.mean().item() for v in video_features_list]}")
+            elif self.cfg.untied or self.cfg.mtrans:
+                # single sentence model MART untied or Vanilla Transformer
+                meta = batch[2]  # list(dict), len == bsz
+
+                # validate
+                batched_data = prepare_batch_inputs(batch[0], use_cuda=self.cfg.use_cuda,
+                                                    non_blocking=self.cfg.cuda_non_blocking)
+                video_feature = batched_data["video_feature"]
+                video_mask = batched_data["video_mask"]
+                text_ids = batched_data["text_ids"]
+                text_mask = batched_data["text_mask"]
+                text_labels = batched_data["text_labels"]
+
+                loss, pred_scores = self.model(video_feature, video_mask, text_ids, text_mask, text_labels)
+                pred_scores_list = [pred_scores]
+                input_labels_list = [text_labels]
+
+                # translate
+                model_inputs = [batched_data["video_feature"], batched_data["video_mask"], batched_data["text_ids"],
+                                batched_data["text_mask"], batched_data["text_labels"]]
+
+                dec_seq = self.translator.translate_batch(
+                    model_inputs, use_beam=self.cfg.use_beam, recurrent=False, untied=True)
+                for example_idx, (cur_gen_sen, cur_meta) in enumerate(zip(dec_seq, meta)):
+                    # example_idx indicates which example is in the batch
+                    cur_data = {
+                        "sentence": dataset.convert_ids_to_sentence(cur_gen_sen.cpu().tolist()),
+                        # remove encoding .encode("utf-8"), "ascii", "ignore"),
+                        "timestamp": cur_meta["timestamp"], "gt_sentence": cur_meta["gt_sentence"]}
+                    batch_res["results"][cur_meta["name"]].append(cur_data)
+            else:
+                # non-recurrent but also not untied model (?)
+                meta = batch[2]  # list(dict), len == bsz
+
+                # validate
+                batched_data = prepare_batch_inputs(batch[0], use_cuda=self.cfg.use_cuda,
+                                                    non_blocking=self.cfg.cuda_non_blocking)
+                input_ids = batched_data["input_ids"]
+                video_features = batched_data["video_feature"]
+                input_masks = batched_data["input_mask"]
+                token_type_ids = batched_data["token_type_ids"]
+                input_labels = batched_data["input_labels"]
+                loss, pred_scores = self.model(input_ids, video_features, input_masks, token_type_ids, input_labels)
+                pred_scores_list = [pred_scores]
+                input_labels_list = [input_labels]
+                # translate
+                model_inputs = [batched_data["input_ids"], batched_data["video_feature"],
+                                batched_data["input_mask"], batched_data["token_type_ids"]]
+                dec_seq = self.translator.translate_batch(
+                    model_inputs, use_beam=self.cfg.use_beam, recurrent=False, untied=False)
+                for example_idx, (cur_gen_sen, cur_meta) in enumerate(zip(dec_seq, meta)):
+                    # example_idx indicates which example is in the batch
+                    cur_data = {
+                        "sentence": dataset.convert_ids_to_sentence(cur_gen_sen.cpu().tolist()),
+                        # remove encoding .encode("utf-8"), "ascii", "ignore"),
+                        "timestamp": cur_meta["timestamp"], "gt_sentence": cur_meta["gt_sentence"]}
+                    batch_res["results"][cur_meta["name"]].append(cur_data)
+
+            # keep logs
+            n_correct = 0
+            n_word = 0
+            for pred, gold in zip(pred_scores_list, input_labels_list):
+                n_correct += cal_performance(pred, gold)
+                valid_label_mask = gold.ne(RecursiveCaptionDataset.IGNORE)
+                n_word += valid_label_mask.sum().item()
+
+            # calculate metrix
+            n_word_total += n_word
+            n_word_correct += n_correct
+            total_loss += loss.item()
+
+            # end of step
+            self.hook_post_forward_step_timer()
+            forward_time_total += self.timedelta_step_forward
+            num_steps += 1
+
+            pbar.update()
+        pbar.close()
 
     def get_opt_state(self) -> Dict[str, Dict[str, nn.Parameter]]:
         """
