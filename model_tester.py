@@ -28,6 +28,7 @@ def main():
     arguments_mart.add_mart_args(parser)  # some more paths for mart
     parser.add_argument("--load_model", type=str, default=None, help="Load model from file.")
     parser.add_argument("--print_model", action="store_true", help=f"Print model")
+    parser.add_argument("--embedding_filename", type=str, help=f"Filename of the embedding")
     args = parser.parse_args()
 
     # load repository config yaml file to dict
@@ -76,37 +77,35 @@ def main():
         load_epoch=args.load_epoch, load_model=args.load_model, inference_only=args.validate,
         annotations_dir=args.annotations_dir)
 
-    # "v___c8enCfzqw": {"duration": 172.8, "timestamps": [[0, 51.84], [24.19, 118.37], [72.58, 157.25], [132.19, 172.8]],
-    #                   "sentences": [
-    #                       "A lady in black jacket is posing for the camera, then a man with medium length hair is shown, the man touched her hair to check on it, then the girl blow dry her hair.",
-    #                       " The lady sat at the center of the studio with her wet hair, she put a white cream on her hand then rub it on her hair.",
-    #                       " The girl blow dry her hair with white blower, sectioned her hair, brushed her hair with roller brush while blow drying it at the same time, she roll the brush downwards and upwards.",
-    #                       " She styled her hair by brushing and combing it to give more volume."]}
+    emb = h5py.File(args.embedding_filename)
 
-    filename = "provided_embeddings/yc2_100m_coot_val.h5"
 
-    emb = h5py.File(filename)
 
-    coot_feat = emb['vid_emb'][:3][:]
+    for key in enumerate(emb.keys()):
+        try:
+            coot_feat = val_set.load_coot_video_feature(key[1])
+        except Exception:
+            continue
 
-    all_inputs = train_set.clip_sentence_to_feature("__c8enCfzqw", [24.19, 118.37],  " The lady sat at the center of the studio "
-                                                                            "with her wet hair, she put a white cream "
-                                                                            "on her hand then rub it on her hair.",
-                                           coot_feat, 1)
 
-    batch = [[{'name':[all_inputs[0]['name']], 'input_tokens':[all_inputs[0]['input_tokens']],
-              'input_ids':torch.tensor(np.array([all_inputs[0]['input_ids']])), 'input_labels':torch.tensor(np.array([all_inputs[0]['input_labels']])),
-              'input_mask':torch.tensor(np.array([all_inputs[0]['input_mask']])), 'token_type_ids':torch.tensor(np.array([all_inputs[0]['token_type_ids']])),
-              'video_feature':torch.tensor(np.array([all_inputs[0]['video_feature']]))}], [2,2], [{'name': "v___c8enCfzqw",
-                     'timestamp' :[[0, 51.84], [24.19, 118.37],
-                                  [72.58, 157.25], [132.19, 172.8]],
-                     'gt_sentence':[
-                        "A lady in black jacket is posing for the camera, then a man with medium length hair is shown, the man touched her hair to check on it, then the girl blow dry her hair.",
-                        " The lady sat at the center of the studio with her wet hair, she put a white cream on her hand then rub it on her hair.",
-                        " The girl blow dry her hair with white blower, sectioned her hair, brushed her hair with roller brush while blow drying it at the same time, she roll the brush downwards and upwards.",
-                        " She styled her hair by brushing and combing it to give more volume."]}]]
 
-    trainer.generate_text_external_source(batch, val_loader)
+
+
+
+
+        all_inputs = train_set.clip_sentence_to_feature("__c8enCfzqw", [24.19, 118.37],  "",
+                                               coot_feat, 1)
+
+        batch = [[{'name':[all_inputs[0]['name']], 'input_tokens':[all_inputs[0]['input_tokens']],
+                  'input_ids':torch.tensor(np.array([all_inputs[0]['input_ids']])), 'input_labels':torch.tensor(np.array([all_inputs[0]['input_labels']])),
+                  'input_mask':torch.tensor(np.array([all_inputs[0]['input_mask']])), 'token_type_ids':torch.tensor(np.array([all_inputs[0]['token_type_ids']])),
+                  'video_feature':torch.tensor(np.array([all_inputs[0]['video_feature']]))}], [2,2], [{'name': "",
+                         'timestamp' :[[0, 51.84], [24.19, 118.37],
+                                      [72.58, 157.25], [132.19, 172.8]],
+                         'gt_sentence':[
+                            ""]}]]
+
+        trainer.generate_text_external_source(batch, val_loader)
 
 
 if __name__ == "__main__":

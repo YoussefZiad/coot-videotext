@@ -345,6 +345,56 @@ class RecursiveCaptionDataset(data.Dataset):
         clip_feats = np.stack(clip_feats, axis=0)
         return vid_feat, vidctx_feat, clip_feats
 
+    def load_coot_video_feature(self, raw_name: str) -> Tuple[np.array, np.array, List[np.array]]:
+        """
+        Load given COOT video features.
+
+        Args:
+            raw_name: Video ID
+
+        Returns:
+            Tuple of:
+                video with shape (dim_video)
+                context with shape (dim_clip)
+                clips with shape (dim_clip)
+        """
+        if self.preload and self.preloading_done:
+            return self.preloaded_videos[raw_name]
+        try:
+            # load video with default name
+            vid_num = self.coot_vid_id_to_vid_number[raw_name]
+            fixed_name = raw_name
+        except KeyError:
+            # not found, have to modify the name for activitynet
+            mode = "val_1" if self.mode == "val" else self.mode
+            fixed_name = f"{raw_name[2:]}_{mode}"
+            vid_num = self.coot_vid_id_to_vid_number[fixed_name]
+        h5 = h5py.File(self.coot_emb_h5_file, "r")
+
+        if "vid_emb" not in h5:
+            # backwards compatibility
+            embs = ['vid_norm', 'vid', 'clip_norm', 'clip', 'vid_ctx_norm', 'vid_ctx',
+                    'par_norm', 'par', 'sent_norm', 'sent', 'par_ctx_norm', 'par_ctx']
+            (f_vid_emb, f_vid_emb_before_norm, f_clip_emb, f_clip_emb_before_norm,
+             f_vid_context, f_vid_context_before_norm,
+             f_par_emb, f_par_emb_before_norm, f_sent_emb, f_sent_emb_before_norm,
+             f_par_context, f_par_context_before_norm) = embs
+        else:
+            # new version
+            f_vid_emb, f_clip_emb, f_vid_context, f_par_emb, f_sent_emb, f_par_context = [
+                'vid_emb', 'clip_emb', 'vid_context', 'par_emb', 'sent_emb', 'par_context']
+
+        vid_feat = np.array(h5[f_vid_emb][vid_num])
+        vidctx_feat = np.array(h5[f_vid_context][vid_num])
+        num_clips = self.coot_clip_nums[vid_num]
+        clip_feats = []
+        for clip in range(num_clips):
+            clip_num = self.coot_vid_clip_id_to_clip_number[f"{fixed_name}/{clip}"]
+            clip_feat = np.array(h5[f_clip_emb][clip_num])
+            clip_feats.append(clip_feat)
+        clip_feats = np.stack(clip_feats, axis=0)
+        return vid_feat, vidctx_feat, clip_feats
+
     def convert_example_to_features(self, example):
         """
         example single sentence
